@@ -1,0 +1,58 @@
+name: Scan Bilibili catalog
+run-name: Scheduled scan ${{ inputs.dispatch_slot }}
+on:
+  workflow_dispatch:
+    inputs:
+      dispatch_slot:
+        description: UTC minute recorded by the dispatcher
+        type: string
+        required: true
+
+permissions:
+  contents: read
+
+jobs:
+  scan:
+    runs-on: ubuntu-24.04
+    timeout-minutes: 25
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          persist-credentials: false
+      - uses: actions/setup-node@v4
+        with:
+          node-version: '22'
+      - run: npm ci --ignore-scripts --no-audit --no-fund
+      - name: Collect and encrypt catalog
+        env:
+          SOURCE_CONFIG: ${{ secrets.COLLECTOR_SOURCES }}
+          IMPORT_CERT: ${{ vars.COLLECTOR_IMPORT_CERT }}
+        run: |
+          set -euo pipefail
+          umask 077
+          work=$(mktemp -d "$RUNNER_TEMP/catalog.XXXXXXXX")
+          trap 'rm -rf -- "$work"' EXIT
+          : "${SOURCE_CONFIG:?Missing collector source configuration}"
+          : "${IMPORT_CERT:?Missing collector import certificate}"
+          printf '%s' "$SOURCE_CONFIG" | base64 -d > "$work/sources.json"
+          printf '%s\n' "$IMPORT_CERT" > "$work/import.pem"
+          unset SOURCE_CONFIG IMPORT_CERT
+          export SONG_SEARCH_SOURCES_PATH="$work/sources.json"
+          export SONG_SEARCH_STATE_DIR="$work"
+          export CHROME_PATH="$(command -v google-chrome)"
+          result=0
+          xvfb-run -a node scripts/scan.js --headful --export > "$work/scan.log" 2>&1 || result=$?
+          if [ ! -s "$work/batch.json" ]; then
+            echo "::error::Collector did not produce a batch"
+            exit 1
+          fi
+          openssl cms -encrypt -aes-256-gcm -binary -outform DER \
+            -in "$work/batch.json" -recip "$work/import.pem" -out "$RUNNER_TEMP/batch.cms"
+          exit "$result"
+      - uses: actions/upload-artifact@v4
+        if: ${{ !cancelled() }}
+        with:
+          name: catalog-batch
+          path: ${{ runner.temp }}/batch.cms
+          if-no-files-found: error
+          retention-days: 1
